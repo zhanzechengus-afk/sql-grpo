@@ -5,6 +5,7 @@ if [[ ${1:-} == --help || ${1:-} == -h ]]; then
 Usage: scripts/run_control.sh MODE MODEL REVISION DATA_DIR SEED SFT_CHECKPOINT OUT_DIR [SOURCE_RL_DIR]
 
 Baselines: sql-only, full, zero-code, naive, retention, pcgrad, sql-only-double-prompts
+Auxiliary reward control: shuffled-code
 Ablations: no-projection, no-norm-match, no-gate, no-kl
 Sensitivity: weight-024, weight-036, kl-0008, kl-0012, gate-016, gate-024
 Capacity: table2-shared-r8, table2-adapter-r8, table2-adapter-r16
@@ -43,6 +44,7 @@ extra=()
 alpha=
 case "$mode" in
     full) ;;
+    shuffled-code) extra=(--auxiliary-mode shuffled) ;;
     sql-only) branch=sql_only ;;
     zero-code) branch=zero_code ;;
     naive) extra=(--no-project --no-norm-match --no-gate --kl 0 --alpha 1) ;;

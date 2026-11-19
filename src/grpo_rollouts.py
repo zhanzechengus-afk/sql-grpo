@@ -87,8 +87,13 @@ def generate_batch(
     return generated
 
 
-def collect_domain(model, tokenizer, domain, examples, scorer, config, generator):
+def collect_domain(
+    model, tokenizer, domain, examples, scorer, config, generator, *,
+    reward_rng=None, reward_stats=None,
+):
     responses, means = [], []
+    changed_rewards = 0
+    variable_groups = 0
     for example in examples:
         group = generate_batch(
             model,
@@ -103,13 +108,28 @@ def collect_domain(model, tokenizer, domain, examples, scorer, config, generator
             scorer(tokenizer.decode(r.tokens, skip_special_tokens=True), example)
             for r in group
         ]
-        adv = group_advantages(torch.tensor([rewards], dtype=torch.float32))[0]
+        if reward_stats is not None:
+            variable_groups += min(rewards) != max(rewards)
+        if reward_rng is not None:
+            assigned = rewards.copy()
+            reward_rng.shuffle(assigned)
+            changed_rewards += sum(a != b for a, b in zip(rewards, assigned))
+        else:
+            assigned = rewards
+        adv = group_advantages(torch.tensor([assigned], dtype=torch.float32))[0]
         for row, value in zip(group, adv.tolist()):
             row.advantage = (
                 0.0 if domain == "code" and config.branch == "zero_code" else value
             )
         responses.extend(group)
         means.append(sum(rewards) / len(rewards))
+    if reward_stats is not None:
+        reward_stats.update(
+            aux_prompt_groups=len(means),
+            aux_variable_reward_groups=variable_groups,
+            aux_responses=len(responses),
+            aux_changed_rewards=changed_rewards,
+        )
     return responses, sum(means) / len(means)
 
 

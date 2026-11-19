@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 import copy
 import json
+import random
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -8,6 +9,44 @@ import torch
 from torch import nn
 
 from src.train_grpo import CODE_PREFIX, parse_config, train
+from src.grpo_objective import group_advantages
+from src.grpo_rollouts import Response, collect_domain
+
+
+def test_rewards_shuffled_only_within_a_prompt_after_verification():
+    rewards = {"mixed": [0., 1., 0.5, 1.], "tied": [0.05] * 4}
+    examples = [{"prompt": p} for p in rewards]
+    config = SimpleNamespace(group_size=4, branch="full")
+    calls = []
+
+    def samples(*args):
+        return [Response([1], [i], [-1.]) for i in range(4)]
+
+    def verify(answer, row):
+        calls.append((row["prompt"], answer))
+        return rewards[row["prompt"]][int(answer)]
+
+    for shuffle in (False, True):
+        stats = {}
+        rng = random.Random(5) if shuffle else None
+        with patch("src.grpo_rollouts.generate_batch", side_effect=samples):
+            batch, mean = collect_domain(None, ToyTokenizer(), "code", examples, verify,
+                                         config, None, reward_rng=rng, reward_stats=stats)
+        assert calls == [(p, str(i)) for p in rewards for i in range(4)]
+        calls.clear()
+        expected = [v.copy() for v in rewards.values()]
+        if shuffle:
+            replay = random.Random(5)
+            for group in expected:
+                replay.shuffle(group)
+        targets = group_advantages(torch.tensor(expected)).flatten()
+        torch.testing.assert_close(torch.tensor([r.advantage for r in batch]), targets)
+        assert [r.tokens for r in batch] == [[i] for i in range(4)] * 2
+        changed = sum(a != b for a, b in zip(expected[0], rewards["mixed"]))
+        assert bool(changed) == shuffle
+        assert stats == dict(aux_prompt_groups=2, aux_variable_reward_groups=1,
+                             aux_responses=8, aux_changed_rewards=changed)
+        assert mean == sum(sum(v) for v in rewards.values()) / 8
 
 
 class ToyPolicy(nn.Module):
@@ -80,9 +119,10 @@ def test_three_grpo_controls_and_deployment(tmp_path):
         patch("src.grpo_rewards.sql_reward", oracle),
         patch("src.grpo_rewards.code_reward", oracle),
     ):
-        for branch in ("sql_only", "zero_code", "full"):
+        for condition in ("sql_only", "zero_code", "full", "shuffled"):
+            branch = "full" if condition == "shuffled" else condition
             device_model = copy.deepcopy(init)
-            path = tmp_path / branch
+            path = tmp_path / condition
             path.mkdir()
             args = parse_config(
                 [
@@ -94,6 +134,8 @@ def test_three_grpo_controls_and_deployment(tmp_path):
                     str(path),
                     "--branch",
                     branch,
+                    "--auxiliary-mode",
+                    "shuffled" if condition == "shuffled" else "verified",
                     "--steps",
                     "1",
                     "--sql-prompts",
@@ -144,7 +186,13 @@ def test_three_grpo_controls_and_deployment(tmp_path):
             if branch == "full":
                 assert metrics["code_responses"] == 8 and "anchor_cosine" in metrics
                 assert not torch.equal(device_model.private["code"], initial_code)
-            outputs[branch] = deployed
+                assert (metrics["aux_changed_rewards"] > 0) == (condition == "shuffled")
+                if condition == "full":
+                    verified_metrics = metrics
+                else:
+                    for name in ("sql_reward", "sql_tokens", "code_reward", "code_tokens"):
+                        assert metrics[name] == verified_metrics[name]
+            outputs[condition] = deployed
     for key in outputs["sql_only"]:
         torch.testing.assert_close(
             outputs["sql_only"][key], outputs["zero_code"][key], rtol=0, atol=0

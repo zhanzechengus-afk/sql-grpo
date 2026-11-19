@@ -194,6 +194,8 @@ def train(model, reference, tokenizer, sft_state, sql, anchors, code, config, ou
         for name, offset in (("sql", 0), ("code", 1))
     }
     code_scorer = functools.partial(code_reward, image=config.code_image)
+    auxiliary_mode = getattr(config, "auxiliary_mode", "verified")
+    reward_rng = random.Random(config.seed + 3) if auxiliary_mode == "shuffled" else None
     anchor = None
     for i in range(config.steps):
         started = time.monotonic()
@@ -225,6 +227,8 @@ def train(model, reference, tokenizer, sft_state, sql, anchors, code, config, ou
                 code_scorer,
                 config,
                 generators["code"],
+                reward_rng=reward_rng,
+                reward_stats=metrics,
             )
             metrics.update(code_reward=reward, code_responses=len(batch))
             metrics["code_tokens"] = backward_domain(
@@ -307,6 +311,10 @@ def parser():
     p.add_argument(
         "--branch", choices=["sql_only", "full", "zero_code"], default="full"
     )
+    p.add_argument(
+        "--auxiliary-mode", choices=["verified", "shuffled"], default="verified",
+        help="Use verified code rewards or shuffle rewards within each code prompt.",
+    )
     p.add_argument("--backend", choices=["torch", "verl"], default="torch")
     p.add_argument("--code-image", default="python:3.11-slim")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -371,6 +379,8 @@ def parse_config(argv=None):
                 p.error(f"invalid config choice for {action.dest}")
         p.set_defaults(**options)
     args = p.parse_args(argv)
+    if args.auxiliary_mode != "verified" and args.branch != "full":
+        p.error("auxiliary reward controls require --branch full")
     if args.rank is None:
         args.rank = 16 if "smollm3" in args.model.lower() else 8
     if args.device != "cpu" and not args.device.startswith("cuda"):
