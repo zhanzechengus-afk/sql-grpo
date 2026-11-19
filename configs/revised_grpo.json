@@ -1,0 +1,19 @@
+{
+  "steps": 142,
+  "sql_prompts": 256,
+  "code_prompts": 256,
+  "group_size": 16,
+  "lr": 0.00001,
+  "clip": 0.2,
+  "kl": 0.001,
+  "alpha": 0.8,
+  "code_weight": 0.30,
+  "gate_denominator": 0.020,
+  "max_scale": 2.0,
+  "anchor_batch": 16,
+  "anchor_refresh": 8,
+  "anchor_ema": 0.90,
+  "project": true,
+  "norm_match": true,
+  "gate": true
+}
