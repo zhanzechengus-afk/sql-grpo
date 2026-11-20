@@ -18,6 +18,10 @@ import torch.nn.functional as F
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.distributed_training import (
+    barrier, distributed_training, max_tensor_, rank, reduce_gradients, shard,
+    sum_tensor_, world_size,
+)
 from src.grpo_objective import align_gradients, update_anchor
 from src.grpo_rollouts import (
     backward_domain,
@@ -148,6 +152,8 @@ def anchor_direction(model, tokenizer, rows, config, previous):
         with torch.no_grad():
             for accum, grad in zip(sums, gradient):
                 accum.add_(grad)
+    for total in sums:
+        sum_tensor_(total)
     return update_anchor(previous, sums, config.anchor_ema)
 
 
@@ -159,6 +165,40 @@ def take_shared(parameters):
         collected.append(param.grad.detach())
         param.grad = None
     return collected
+
+
+def domain_step(model, reference, tokenizer, domain, examples, scorer, config,
+                generator, reward_rng=None):
+    device = next(model.parameters()).device
+    auxiliary_stats = {} if domain == "code" else None
+    local_tokens = local_responses = 0
+    reward = 0.0
+    if examples:
+        batch, reward = collect_domain(
+            model, tokenizer, domain, examples, scorer, config, generator,
+            reward_rng=reward_rng, reward_stats=auxiliary_stats,
+        )
+        local_responses = len(batch)
+        local_tokens = backward_domain(model, reference, tokenizer, domain, batch, config)
+
+    counts = [local_tokens, local_responses, reward * local_responses]
+    auxiliary_keys = ("aux_prompt_groups", "aux_variable_reward_groups",
+                      "aux_responses", "aux_changed_rewards")
+    if auxiliary_stats is not None:
+        counts.extend(auxiliary_stats.get(key, 0) for key in auxiliary_keys)
+    totals = sum_tensor_(torch.tensor(counts, device=device, dtype=torch.float64)).tolist()
+    tokens, responses, reward_sum = totals[:3]
+    if world_size() > 1:
+        active = model.shared_parameters() + model.private_parameters(domain)
+        reduce_gradients(active, local_tokens / tokens)
+    metrics = {
+        f"{domain}_tokens": int(tokens),
+        f"{domain}_responses": int(responses),
+        f"{domain}_reward": reward_sum / responses,
+    }
+    if auxiliary_stats is not None:
+        metrics.update(zip(auxiliary_keys, map(int, totals[3:])))
+    return metrics
 
 
 def train(model, reference, tokenizer, sft_state, sql, anchors, code, config, output):
@@ -191,8 +231,9 @@ def train(model, reference, tokenizer, sft_state, sql, anchors, code, config, ou
         name: random.Random(config.seed + offset)
         for name, offset in (("sql", 0), ("anchor", 1), ("code", 2))
     }
+    worker_seed = config.seed + 1000003 * rank()
     generators = {
-        name: torch.Generator(device=device).manual_seed(config.seed + offset)
+        name: torch.Generator(device=device).manual_seed(worker_seed + offset)
         for name, offset in (("sql", 0), ("code", 1))
     }
     auxiliary_mode = getattr(config, "auxiliary_mode", "verified")
@@ -202,7 +243,7 @@ def train(model, reference, tokenizer, sft_state, sql, anchors, code, config, ou
         code_scorer = arithmetic_reward
     else:
         code_scorer = functools.partial(code_reward, image=config.code_image)
-    reward_rng = random.Random(config.seed + 3) if auxiliary_mode == "shuffled" else None
+    reward_rng = random.Random(worker_seed + 3) if auxiliary_mode == "shuffled" else None
     anchor = None
     for i in range(config.steps):
         started = time.monotonic()
@@ -211,36 +252,21 @@ def train(model, reference, tokenizer, sft_state, sql, anchors, code, config, ou
             torch.cuda.reset_peak_memory_stats(device)
         if track_anchor and i % config.anchor_refresh == 0:
             selected = streams["anchor"].sample(anchors, config.anchor_batch)
-            anchor = anchor_direction(model, tokenizer, selected, config, anchor)
+            anchor = anchor_direction(model, tokenizer, shard(selected), config, anchor)
 
         selected = streams["sql"].sample(sql, config.sql_prompts)
-        batch, reward = collect_domain(
-            model, tokenizer, "sql", selected, sql_reward, config, generators["sql"]
+        metrics = domain_step(
+            model, reference, tokenizer, "sql", shard(selected), sql_reward,
+            config, generators["sql"],
         )
-        metrics = {"step": i + 1, "sql_reward": reward, "sql_responses": len(batch)}
-        metrics["sql_tokens"] = backward_domain(
-            model, reference, tokenizer, "sql", batch, config
-        )
-        del batch
+        metrics["step"] = i + 1
         if config.branch != "sql_only":
             sql_gradient = take_shared(shared)
             selected = streams["code"].sample(code, config.code_prompts)
-            batch, reward = collect_domain(
-                model,
-                tokenizer,
-                "code",
-                selected,
-                code_scorer,
-                config,
-                generators["code"],
-                reward_rng=reward_rng,
-                reward_stats=metrics,
-            )
-            metrics.update(code_reward=reward, code_responses=len(batch))
-            metrics["code_tokens"] = backward_domain(
-                model, None, tokenizer, "code", batch, config
-            )
-            del batch
+            metrics.update(domain_step(
+                model, None, tokenizer, "code", shard(selected), code_scorer,
+                config, generators["code"], reward_rng=reward_rng,
+            ))
             code_gradient = take_shared(shared)
             combined, diagnostics = align_gradients(
                 sql_gradient,
@@ -263,17 +289,24 @@ def train(model, reference, tokenizer, sft_state, sql, anchors, code, config, ou
             error_if_nonfinite=True,
         )
         optimizer.step()
+        peak_bytes = 0
         if device.type == "cuda":
             torch.cuda.synchronize(device)
-            metrics["peak_cuda_allocated_bytes"] = torch.cuda.max_memory_allocated(
-                device
-            )
-        metrics.update(grad_norm=float(grad_norm), seconds=time.monotonic() - started)
-        with (output / "metrics.jsonl").open("a") as f:
-            f.write(json.dumps(metrics, allow_nan=False) + "\n")
-        if config.save_every and (i + 1) % config.save_every == 0:
-            save_state(output / f"step_{i + 1:04d}.pt", model.trainable_state())
+            peak_bytes = torch.cuda.max_memory_allocated(device)
+        seconds, peak_bytes = max_tensor_(torch.tensor(
+            [time.monotonic() - started, peak_bytes], dtype=torch.float64, device=device
+        )).tolist()
+        if rank() == 0:
+            if device.type == "cuda":
+                metrics["peak_cuda_allocated_bytes"] = int(peak_bytes)
+            metrics.update(grad_norm=float(grad_norm), seconds=seconds)
+            with (output / "metrics.jsonl").open("a") as f:
+                f.write(json.dumps(metrics, allow_nan=False) + "\n")
+            if config.save_every and (i + 1) % config.save_every == 0:
+                save_state(output / f"step_{i + 1:04d}.pt", model.trainable_state())
 
+    if rank() != 0:
+        return
     final_state = model.trainable_state()
     save_state(output / "post_rl_trainable.pt", final_state)
     mixed = interpolate(sft_state, final_state, config.alpha)
@@ -285,7 +318,7 @@ def train(model, reference, tokenizer, sft_state, sql, anchors, code, config, ou
 
 def parser():
     p = argparse.ArgumentParser(
-        description='Run the single-device GRPO reconstruction or decode its interpolated SQL checkpoint.\n\nTraining loads the frozen backbone and a seed-specific trainable SQL-SFT state.\nOutput files include resolved_config.json, metrics.jsonl, post_rl_trainable.pt\nand the SQL-only interpolated trainable.pt. Use a fresh output directory for\neach run. Pass the same backbone revision, adapter width and rank for decoding.\n', formatter_class=argparse.RawDescriptionHelpFormatter
+        description="Train GRPO on one device or with torchrun, or decode a SQL checkpoint."
     )
     p.add_argument(
         "--config",
@@ -476,10 +509,33 @@ def write_predictions(destination, rows, model, tokenizer, config):
             temporary.unlink(missing_ok=True)
 
 
-def main(argv=None):
-    c = parse_config(argv)
-    if c.sft_checkpoint:
-        validate_checkpoint_config(c)
+def write_run_config(output, paths, model, c):
+    specs = {
+        **vars(c),
+        "sha256": {key: checkpoint_hash(path) for key, path in paths.items()},
+    }
+    specs["model_commit"] = getattr(model.policy.config, "_commit_hash", None)
+    specs["packages"] = {
+        key: importlib.metadata.version(key)
+        for key in ("torch", "transformers", "peft", "datasets", "sqlglot")
+    }
+    if c.backend == "verl":
+        specs["packages"]["verl"] = importlib.metadata.version("verl")
+    uses_cuda = torch.device(c.device).type == "cuda"
+    specs["hardware"] = {
+        "device": c.device,
+        "world_size": world_size(),
+        "accelerators_used": world_size() if uses_cuda else 0,
+    }
+    if uses_cuda:
+        specs["hardware"].update(
+            gpu=torch.cuda.get_device_name(c.device), cuda_version=torch.version.cuda
+        )
+    specs["sha256"]["sft_checkpoint"] = checkpoint_hash(c.sft_checkpoint)
+    (output / "resolved_config.json").write_text(json.dumps(specs, indent=2) + "\n")
+
+
+def run(c):
     from transformers import AutoTokenizer
     from src.grpo_data import load_rows, write_rows
 
@@ -520,34 +576,17 @@ def main(argv=None):
         reference = load_policy(*model_args)
         reference.load_state_dict(state, strict=False)
     output = Path(c.output_dir)
-    output.mkdir(parents=True, exist_ok=False)
     if c.auxiliary_mode == "arithmetic":
         from src.arithmetic_control import prepare_arithmetic_pool
 
         datasets["code"] = prepare_arithmetic_pool(count=1362, seed=0)
         paths["arithmetic"] = output / "arithmetic_pool.jsonl"
-        write_rows(paths["arithmetic"], datasets["code"])
-    specs = {
-        **vars(c),
-        "sha256": {key: checkpoint_hash(path) for key, path in paths.items()},
-    }
-    specs["model_commit"] = getattr(model.policy.config, "_commit_hash", None)
-    specs["packages"] = {
-        k: importlib.metadata.version(k)
-        for k in ("torch", "transformers", "peft", "datasets", "sqlglot")
-    }
-    if c.backend == "verl":
-        specs["packages"]["verl"] = importlib.metadata.version("verl")
-    specs["hardware"] = {
-        "device": c.device,
-        "accelerators_used": int(torch.device(c.device).type == "cuda"),
-    }
-    if torch.device(c.device).type == "cuda":
-        specs["hardware"].update(
-            gpu=torch.cuda.get_device_name(c.device), cuda_version=torch.version.cuda
-        )
-    specs["sha256"]["sft_checkpoint"] = checkpoint_hash(c.sft_checkpoint)
-    (output / "resolved_config.json").write_text(json.dumps(specs, indent=2) + "\n")
+    if rank() == 0:
+        output.mkdir(parents=True, exist_ok=False)
+        if c.auxiliary_mode == "arithmetic":
+            write_rows(paths["arithmetic"], datasets["code"])
+        write_run_config(output, paths, model, c)
+    barrier()
     train(
         model,
         reference,
@@ -559,6 +598,16 @@ def main(argv=None):
         c,
         output,
     )
+    barrier()
+
+
+def main(argv=None):
+    c = parse_config(argv)
+    if c.sft_checkpoint:
+        validate_checkpoint_config(c)
+    with distributed_training(c.device, predict=bool(c.predict)) as device:
+        c.device = device
+        run(c)
 
 
 if __name__ == "__main__":

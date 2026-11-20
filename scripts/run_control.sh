@@ -11,7 +11,10 @@ Sensitivity: weight-024, weight-036, kl-0008, kl-0012, gate-016, gate-024
 Capacity: table2-shared-r8, table2-adapter-r8, table2-adapter-r16
 Interpolation: alpha-06, alpha-08, alpha-10 (also supply the saved post-RL run directory)
 
-Use an SFT checkpoint with the same seed, backbone, adapter configuration and training split.
+Use common_sql_trainable.pt from the matching seed, backbone, adapter configuration and split.
+Training uses eight visible GPUs on one node by default. Set NPROC_PER_NODE=1 for a single
+device. The standard full run draws 256 SQL and 256 auxiliary prompts globally per update.
+Interpolation sweeps reuse post_rl_trainable.pt and evaluate sql_eval.jsonl in one process.
 Set LOG_SQL_ANCHOR=1 when comparing pcgrad, no-gate, no-norm-match and full
 to measure the independent anchor on the same schedule in all four runs.
 USAGE
@@ -115,11 +118,17 @@ PY
         --alpha "$alpha" --output "$checkpoint"
 else
     [[ $# -eq 7 ]] || { echo 'Only alpha modes accept a source RL directory.' >&2; exit 2; }
+    workers=${NPROC_PER_NODE:-8}
+    [[ "$workers" =~ ^[1-9][0-9]*$ ]] || { echo 'NPROC_PER_NODE must be a positive integer.' >&2; exit 2; }
+    train=(python -m)
+    if [[ "$workers" != 1 ]]; then
+        train=(torchrun --standalone --nnodes=1 --nproc-per-node="$workers" --module)
+    fi
     if [[ "$branch" != sql_only && "$mode" != arithmetic ]]; then
         image_id=$(docker image inspect --format '{{.Id}}' "${CODE_IMAGE:-python:3.11-slim}")
         extra+=(--code-image "$image_id")
     fi
-    python -m src.train_grpo --config configs/revised_grpo.json "${base[@]}" \
+    "${train[@]}" src.train_grpo --config configs/revised_grpo.json "${base[@]}" \
         --branch "$branch" --backend "${GRPO_BACKEND:-torch}" --sft-checkpoint "$sft" \
         --output-dir "$dest" ${extra[@]+"${extra[@]}"}
     checkpoint="$dest/trainable.pt"
