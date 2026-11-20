@@ -132,4 +132,10 @@ def align_gradients(
     for mixed, s in zip(combined, sql):
         mixed.mul_(factor).add_(s)
     values = torch.stack(list(diagnostics.values())).tolist()
-    return combined, dict(zip(diagnostics, values))
+    metrics = dict(zip(diagnostics, values))
+    if metrics["sql_grad_norm"] > 0:
+        projected_ratio = metrics["projected_code_grad_norm"] / metrics["sql_grad_norm"]
+        metrics["code_to_sql_norm_ratio"] = metrics["code_grad_norm"] / metrics["sql_grad_norm"]
+        metrics["projected_code_to_sql_norm_ratio"] = projected_ratio
+        metrics["scaled_code_to_sql_norm_ratio"] = projected_ratio * metrics["norm_scale"]
+    return combined, metrics

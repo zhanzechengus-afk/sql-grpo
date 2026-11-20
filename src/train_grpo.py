@@ -170,7 +170,9 @@ def train(model, reference, tokenizer, sft_state, sql, anchors, code, config, ou
         raise ValueError(
             "not enough distinct prompts in prepared split for an iteration"
         )
-    if config.branch == "full" and config.gate and len(anchors) < config.anchor_batch:
+    use_gate = config.branch == "full" and config.gate
+    track_anchor = use_gate or getattr(config, "log_anchor", False)
+    if track_anchor and len(anchors) < config.anchor_batch:
         raise ValueError("not enough distinct reserved SQL anchor examples")
     if {r["id"] for r in sql} & {r["id"] for r in anchors}:
         raise ValueError("SQL training and anchor IDs must be disjoint")
@@ -193,8 +195,13 @@ def train(model, reference, tokenizer, sft_state, sql, anchors, code, config, ou
         name: torch.Generator(device=device).manual_seed(config.seed + offset)
         for name, offset in (("sql", 0), ("code", 1))
     }
-    code_scorer = functools.partial(code_reward, image=config.code_image)
     auxiliary_mode = getattr(config, "auxiliary_mode", "verified")
+    if auxiliary_mode == "arithmetic":
+        from src.arithmetic_control import arithmetic_reward
+
+        code_scorer = arithmetic_reward
+    else:
+        code_scorer = functools.partial(code_reward, image=config.code_image)
     reward_rng = random.Random(config.seed + 3) if auxiliary_mode == "shuffled" else None
     anchor = None
     for i in range(config.steps):
@@ -202,8 +209,7 @@ def train(model, reference, tokenizer, sft_state, sql, anchors, code, config, ou
         optimizer.zero_grad(set_to_none=True)
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
-        use_gate = config.branch == "full" and config.gate
-        if use_gate and i % config.anchor_refresh == 0:
+        if track_anchor and i % config.anchor_refresh == 0:
             selected = streams["anchor"].sample(anchors, config.anchor_batch)
             anchor = anchor_direction(model, tokenizer, selected, config, anchor)
 
@@ -312,8 +318,9 @@ def parser():
         "--branch", choices=["sql_only", "full", "zero_code"], default="full"
     )
     p.add_argument(
-        "--auxiliary-mode", choices=["verified", "shuffled"], default="verified",
-        help="Use verified code rewards or shuffle rewards within each code prompt.",
+        "--auxiliary-mode", choices=["verified", "shuffled", "arithmetic"],
+        default="verified",
+        help="Use verified code rewards, shuffle rewards within each code prompt, or use graded arithmetic.",
     )
     p.add_argument("--backend", choices=["torch", "verl"], default="torch")
     p.add_argument("--code-image", default="python:3.11-slim")
@@ -321,6 +328,8 @@ def parser():
     p.add_argument("--project", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--norm-match", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--gate", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--log-anchor", action="store_true",
+                   help="Measure anchor agreement even when the full branch's gate is disabled.")
     p.add_argument("--rank", type=int, help="defaults to 8 (Qwen) or 16 (SmolLM3)")
     p.add_argument(
         "--adapter-type",
@@ -381,6 +390,8 @@ def parse_config(argv=None):
     args = p.parse_args(argv)
     if args.auxiliary_mode != "verified" and args.branch != "full":
         p.error("auxiliary reward controls require --branch full")
+    if args.log_anchor and args.branch != "full":
+        p.error("--log-anchor requires --branch full")
     if args.rank is None:
         args.rank = 16 if "smollm3" in args.model.lower() else 8
     if args.device != "cpu" and not args.device.startswith("cuda"):
@@ -470,7 +481,7 @@ def main(argv=None):
     if c.sft_checkpoint:
         validate_checkpoint_config(c)
     from transformers import AutoTokenizer
-    from src.grpo_data import load_rows
+    from src.grpo_data import load_rows, write_rows
 
     tokenizer = AutoTokenizer.from_pretrained(c.model, revision=c.model_revision)
     if tokenizer.pad_token_id is None:
@@ -498,7 +509,7 @@ def main(argv=None):
         return
     source = Path(c.data_dir)
     paths = {"sql": source / "sql_train.jsonl", "anchor": source / "sql_anchor.jsonl"}
-    if c.branch != "sql_only":
+    if c.branch != "sql_only" and c.auxiliary_mode != "arithmetic":
         paths["code"] = source / "code_train.jsonl"
     datasets = {
         name: load_rows(path, "code" if name == "code" else "sql")
@@ -510,6 +521,12 @@ def main(argv=None):
         reference.load_state_dict(state, strict=False)
     output = Path(c.output_dir)
     output.mkdir(parents=True, exist_ok=False)
+    if c.auxiliary_mode == "arithmetic":
+        from src.arithmetic_control import prepare_arithmetic_pool
+
+        datasets["code"] = prepare_arithmetic_pool(count=1362, seed=0)
+        paths["arithmetic"] = output / "arithmetic_pool.jsonl"
+        write_rows(paths["arithmetic"], datasets["code"])
     specs = {
         **vars(c),
         "sha256": {key: checkpoint_hash(path) for key, path in paths.items()},

@@ -14,9 +14,11 @@ class Response:
     advantage: float = 0.0
 
 
-def prompt_ids(tokenizer, prompt):
+def prompt_ids(
+    tokenizer, prompt, system_instruction="Return only an exact, executable solution."
+):
     messages = [
-        {"role": "system", "content": "Return only an exact, executable solution."},
+        {"role": "system", "content": system_instruction},
         {"role": "user", "content": prompt},
     ]
     tokens = tokenizer.apply_chat_template(
@@ -36,7 +38,11 @@ def generate_batch(
     model, tokenizer, domain, prompt, count, config, generator=None, greedy=False
 ):
     budget = config.sql_new_tokens if domain == "sql" else config.code_new_tokens
-    prefix = prompt_ids(tokenizer, prompt)[-(config.max_length - budget) :]
+    if domain == "code" and getattr(config, "auxiliary_mode", "verified") == "arithmetic":
+        prefix = prompt_ids(tokenizer, prompt, "Give the exact integer answer.")
+    else:
+        prefix = prompt_ids(tokenizer, prompt)
+    prefix = prefix[-(config.max_length - budget) :]
     device = next(model.parameters()).device
     eos = set()
     for ids in (

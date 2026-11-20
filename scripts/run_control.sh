@@ -5,13 +5,15 @@ if [[ ${1:-} == --help || ${1:-} == -h ]]; then
 Usage: scripts/run_control.sh MODE MODEL REVISION DATA_DIR SEED SFT_CHECKPOINT OUT_DIR [SOURCE_RL_DIR]
 
 Baselines: sql-only, full, zero-code, naive, retention, pcgrad, sql-only-double-prompts
-Auxiliary reward control: shuffled-code
+Auxiliary reward controls: shuffled-code, arithmetic
 Ablations: no-projection, no-norm-match, no-gate, no-kl
 Sensitivity: weight-024, weight-036, kl-0008, kl-0012, gate-016, gate-024
 Capacity: table2-shared-r8, table2-adapter-r8, table2-adapter-r16
 Interpolation: alpha-06, alpha-08, alpha-10 (also supply the saved post-RL run directory)
 
 Use an SFT checkpoint with the same seed, backbone, adapter configuration and training split.
+Set LOG_SQL_ANCHOR=1 when comparing pcgrad, no-gate, no-norm-match and full
+to measure the independent anchor on the same schedule in all four runs.
 USAGE
     exit 0
 fi
@@ -45,6 +47,7 @@ alpha=
 case "$mode" in
     full) ;;
     shuffled-code) extra=(--auxiliary-mode shuffled) ;;
+    arithmetic) extra=(--auxiliary-mode arithmetic) ;;
     sql-only) branch=sql_only ;;
     zero-code) branch=zero_code ;;
     naive) extra=(--no-project --no-norm-match --no-gate --kl 0 --alpha 1) ;;
@@ -74,6 +77,10 @@ case "$mode" in
     alpha-10) alpha=1.0 ;;
     *) echo "Unknown control: $mode" >&2; exit 2 ;;
 esac
+
+if [[ "${LOG_SQL_ANCHOR:-0}" == 1 && "$branch" == full ]]; then
+    extra+=(--log-anchor)
+fi
 
 evaluation=(--data "$data/sql_eval.jsonl")
 if [[ -n "${SPIDER_EVALUATOR_DIR:-}" || -n "${SPIDER_TEST_SUITE_DB_DIR:-}" ]]; then
@@ -108,7 +115,7 @@ PY
         --alpha "$alpha" --output "$checkpoint"
 else
     [[ $# -eq 7 ]] || { echo 'Only alpha modes accept a source RL directory.' >&2; exit 2; }
-    if [[ "$branch" != sql_only ]]; then
+    if [[ "$branch" != sql_only && "$mode" != arithmetic ]]; then
         image_id=$(docker image inspect --format '{{.Id}}' "${CODE_IMAGE:-python:3.11-slim}")
         extra+=(--code-image "$image_id")
     fi
